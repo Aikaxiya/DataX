@@ -22,6 +22,7 @@ import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 public class CommonRdbmsWriter {
@@ -208,7 +209,7 @@ public class CommonRdbmsWriter {
             this.password = writerSliceConfig.getString(Key.PASSWORD);
             this.jdbcUrl = writerSliceConfig.getString(Key.JDBC_URL);
 
-            //ob10的处理
+            // ob10的处理
             if (this.jdbcUrl.startsWith(Constant.OB10_SPLIT_STRING) && this.dataBaseType == DataBaseType.MySql) {
                 String[] ss = this.jdbcUrl.split(Constant.OB10_SPLIT_STRING_PATTERN);
                 if (ss.length != 3) {
@@ -261,32 +262,54 @@ public class CommonRdbmsWriter {
 
         public void startWriteWithConnection(RecordReceiver recordReceiver, TaskPluginCollector taskPluginCollector, Connection connection) {
             this.taskPluginCollector = taskPluginCollector;
+            List<String> mergeColumns = new ArrayList<>();
+
+            if (this.dataBaseType == DataBaseType.Oracle && !"insert".equalsIgnoreCase(this.writeMode)) {
+                LOG.info("write oracle using {} mode", this.writeMode);
+                List<String> columnsOne = new ArrayList<>();
+                List<String> columnsTwo = new ArrayList<>();
+                String merge = this.writeMode;
+                String[] sArray = WriterUtil.getStrings(merge);
+                for (String s : this.columns) {
+                    if (Arrays.asList(sArray).contains(s)) {
+                        columnsOne.add(s);
+                    }
+                }
+                for (String s : this.columns) {
+                    if (!Arrays.asList(sArray).contains(s)) {
+                        columnsTwo.add(s);
+                    }
+                }
+                int i = 0;
+                for (String column : columnsOne) {
+                    mergeColumns.add(i++, column);
+                }
+                for (String column : columnsTwo) {
+                    mergeColumns.add(i++, column);
+                }
+            }
+            mergeColumns.addAll(this.columns);
 
             // 用于写入数据的时候的类型根据目的表字段类型转换
-            this.resultSetMetaData = DBUtil.getColumnMetaData(connection,
-                    this.table, StringUtils.join(this.columns, ","));
+            this.resultSetMetaData = DBUtil.getColumnMetaData(connection, this.table, StringUtils.join(mergeColumns, ","));
+
             // 写数据库的SQL语句
             calcWriteRecordSql();
 
-            List<Record> writeBuffer = new ArrayList<Record>(this.batchSize);
+            List<Record> writeBuffer = new ArrayList<>(this.batchSize);
             int bufferBytes = 0;
+
             try {
                 Record record;
                 while ((record = recordReceiver.getFromReader()) != null) {
                     if (record.getColumnNumber() != this.columnNumber) {
                         // 源头读取字段列数与目的表字段写入列数不相等，直接报错
-                        throw DataXException
-                                .asDataXException(
-                                        DBUtilErrorCode.CONF_ERROR,
-                                        String.format(
-                                                "列配置信息有错误. 因为您配置的任务中，源头读取字段数:%s 与 目的表要写入的字段数:%s 不相等. 请检查您的配置并作出修改.",
-                                                record.getColumnNumber(),
-                                                this.columnNumber));
+                        throw DataXException.asDataXException(DBUtilErrorCode.CONF_ERROR,
+                                String.format("列配置信息有错误. 因为您配置的任务中，源头读取字段数:%s 与 目的表要写入的字段数:%s 不相等. 请检查您的配置并作出修改.",
+                                        record.getColumnNumber(), this.columnNumber));
                     }
-
                     writeBuffer.add(record);
                     bufferBytes += record.getMemorySize();
-
                     if (writeBuffer.size() >= batchSize || bufferBytes >= batchByteSize) {
                         doBatchInsert(connection, writeBuffer);
                         writeBuffer.clear();
@@ -296,17 +319,15 @@ public class CommonRdbmsWriter {
                 if (!writeBuffer.isEmpty()) {
                     doBatchInsert(connection, writeBuffer);
                     writeBuffer.clear();
-                    bufferBytes = 0;
                 }
             } catch (Exception e) {
-                throw DataXException.asDataXException(
-                        DBUtilErrorCode.WRITE_DATA_ERROR, e);
+                throw DataXException.asDataXException(DBUtilErrorCode.WRITE_DATA_ERROR, e);
             } finally {
                 writeBuffer.clear();
-                bufferBytes = 0;
                 DBUtil.closeDBResources(null, null, connection);
             }
         }
+
 
         // TODO 改用连接池，确保每次获取的连接都是可用的（注意：连接可能需要每次都初始化其 session）
         public void startWrite(RecordReceiver recordReceiver,
@@ -341,17 +362,14 @@ public class CommonRdbmsWriter {
         public void destroy(Configuration writerSliceConfig) {
         }
 
-        protected void doBatchInsert(Connection connection, List<Record> buffer)
-                throws SQLException {
+        protected void doBatchInsert(Connection connection, List<Record> buffer) throws SQLException {
             PreparedStatement preparedStatement = null;
             try {
                 connection.setAutoCommit(false);
-                preparedStatement = connection
-                        .prepareStatement(this.writeRecordSql);
-
+                preparedStatement = connection.prepareStatement(this.writeRecordSql);
+                int valNum = StringUtils.countMatches(this.writeRecordSql, "?");
                 for (Record record : buffer) {
-                    preparedStatement = fillPreparedStatement(
-                            preparedStatement, record);
+                    preparedStatement = fillPreparedStatement(preparedStatement, record, valNum);
                     preparedStatement.addBatch();
                 }
                 preparedStatement.executeBatch();
@@ -361,8 +379,7 @@ public class CommonRdbmsWriter {
                 connection.rollback();
                 doOneInsert(connection, buffer);
             } catch (Exception e) {
-                throw DataXException.asDataXException(
-                        DBUtilErrorCode.WRITE_DATA_ERROR, e);
+                throw DataXException.asDataXException(DBUtilErrorCode.WRITE_DATA_ERROR, e);
             } finally {
                 DBUtil.closeDBResources(preparedStatement, null);
             }
@@ -372,17 +389,14 @@ public class CommonRdbmsWriter {
             PreparedStatement preparedStatement = null;
             try {
                 connection.setAutoCommit(true);
-                preparedStatement = connection
-                        .prepareStatement(this.writeRecordSql);
-
+                preparedStatement = connection.prepareStatement(this.writeRecordSql);
+                int valNum = this.writeRecordSql.indexOf("?");
                 for (Record record : buffer) {
                     try {
-                        preparedStatement = fillPreparedStatement(
-                                preparedStatement, record);
+                        preparedStatement = fillPreparedStatement(preparedStatement, record, valNum);
                         preparedStatement.execute();
                     } catch (SQLException e) {
                         LOG.debug(e.toString());
-
                         this.taskPluginCollector.collectDirtyRecord(record, e);
                     } finally {
                         // 最后不要忘了关闭 preparedStatement
@@ -390,22 +404,24 @@ public class CommonRdbmsWriter {
                     }
                 }
             } catch (Exception e) {
-                throw DataXException.asDataXException(
-                        DBUtilErrorCode.WRITE_DATA_ERROR, e);
+                throw DataXException.asDataXException(DBUtilErrorCode.WRITE_DATA_ERROR, e);
             } finally {
                 DBUtil.closeDBResources(preparedStatement, null);
             }
         }
 
         // 直接使用了两个类变量：columnNumber,resultSetMetaData
-        protected PreparedStatement fillPreparedStatement(PreparedStatement preparedStatement, Record record)
-                throws SQLException {
+        protected PreparedStatement fillPreparedStatement(PreparedStatement preparedStatement, Record record, int valNum) throws SQLException {
             for (int i = 0; i < this.columnNumber; i++) {
                 int columnSqltype = this.resultSetMetaData.getMiddle().get(i);
                 String typeName = this.resultSetMetaData.getRight().get(i);
                 preparedStatement = fillPreparedStatementColumnType(preparedStatement, i, columnSqltype, typeName, record.getColumn(i));
+                // 处理oracle merge in using select value的拼值判断
+                if (valNum > this.columnNumber && valNum / this.columnNumber == 2) {
+                    int m = this.columnNumber + i;
+                    preparedStatement = fillPreparedStatementColumnType(preparedStatement, m, columnSqltype, typeName, record.getColumn(i));
+                }
             }
-
             return preparedStatement;
         }
 
@@ -441,7 +457,7 @@ public class CommonRdbmsWriter {
                     }
                     break;
 
-                //tinyint is a little special in some database like mysql {boolean->tinyint(1)}
+                // tinyint is a little special in some database like mysql {boolean->tinyint(1)}
                 case Types.TINYINT:
                     Long longValue = column.asLong();
                     if (null == longValue) {
@@ -556,7 +572,7 @@ public class CommonRdbmsWriter {
                 }
 
                 boolean forceUseUpdate = false;
-                //ob10的处理
+                // ob10的处理
                 if (dataBaseType != null && dataBaseType == DataBaseType.MySql && OriginalConfPretreatmentUtil.isOB10(jdbcUrl)) {
                     forceUseUpdate = true;
                 }
